@@ -26,6 +26,7 @@ use crate::theme::Tokens;
 use crate::widgets;
 
 const PROXY_SIDE: usize = 900;
+mod profiles;
 /// Smallest run of proxy pixels one rayon task takes in the per-pixel passes: below it the
 /// split costs more than the work.
 #[cfg(not(target_arch = "wasm32"))]
@@ -37,6 +38,7 @@ pub struct CameraRawDialog {
     pub layer: LayerId,
     layer_name: String,
     pub params: CameraRaw,
+    profiles: profiles::Panel,
     /// Settings when the dialog opened (stored settings of an edited smart filter).
     original: CameraRaw,
     target: Target,
@@ -97,6 +99,7 @@ impl CameraRawDialog {
             Target::SmartFilter(index) => Some(index),
             Target::NewFilter | Target::OpenRaw => None,
         });
+        result["cameraProfiles"] = self.profiles.describe(self.raw_open.as_ref());
         result["openingRaw"] = json!(self.raw_open.as_ref().map(|r| json!({"name": r.name, "path": r.path, "demosaic": r.demosaic.id()})));
         result["view"] = json!(navigation);
         result["sourceSize"] = json!([self.full_w, self.full_h]);
@@ -346,6 +349,8 @@ pub struct RawOpen {
     pub developed_with: photocraft_io::raw::Demosaic,
     /// The method chosen in the dialog: Open re-develops when it differs from `developed_with`.
     pub demosaic: photocraft_io::raw::Demosaic,
+    pub camera_profile: Option<std::sync::Arc<photocraft_io::raw::CameraProfile>>,
+    pub white_balance_multipliers: Option<[f64; 3]>,
 }
 
 /// Should an interactive open of `name` show the open-time Camera Raw dialog? `warnings` are
@@ -384,6 +389,8 @@ pub fn queue_open_dialog(
         bytes: bytes.map(|b| std::sync::Arc::new(b.to_vec())),
         developed_with: method,
         demosaic: method,
+        camera_profile: None,
+        white_balance_multipliers: None,
     });
     Ok(())
 }
@@ -394,6 +401,7 @@ fn open_raw(app: &mut PhotocraftApp, ctx: &egui::Context, raw: RawOpen) -> Resul
     app.session.set_active(index);
     let (layer, surf, _) = crate::distort_ui::active_pixels(app)?;
     open_pixels(app, ctx, layer, surf, CameraRaw::default(), Coverage::None, Target::OpenRaw)?;
+    let profiles = profiles::Panel::load(app);
     let curve = match (&raw.bytes, &raw.path) {
         (Some(b), _) => Some(photocraft_io::raw::tone_curve(b)),
         #[cfg(not(target_arch = "wasm32"))]
@@ -401,6 +409,7 @@ fn open_raw(app: &mut PhotocraftApp, ctx: &egui::Context, raw: RawOpen) -> Resul
         _ => None,
     };
     if let Some(d) = app.camera_raw.as_mut() {
+        d.profiles = profiles;
         d.layer_name = raw.name.clone();
         // The full-size preview retones the whole frame with it, as Open will.
         let curve = curve.map(std::sync::Arc::new);
@@ -467,6 +476,8 @@ fn commit_open_raw(app: &mut PhotocraftApp, params: &CameraRaw, raw: &RawOpen) -
         clarity: params.clarity,
         texture: params.texture,
         dehaze: params.dehaze,
+        camera_profile: raw.camera_profile.clone(),
+        white_balance_multipliers: raw.white_balance_multipliers,
     };
     // The open itself: the default settings, developed with the method it was opened with.
     let as_opened = photocraft_io::raw::RawTuning { demosaic: raw.developed_with, ..Default::default() };
@@ -772,6 +783,7 @@ fn open_pixels(
         layer_name: name,
         original: params.clone(),
         params,
+        profiles: Default::default(),
         target,
         before_histogram: RgbHistogram::from_rgba(&proxy),
         processed: Vec::new(),
@@ -853,6 +865,12 @@ pub fn menu(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str, params: &Val
     let Some(fields) = ui.as_object() else {
         return Some(Err("Camera Raw ui must be an object".into()));
     };
+    if let Some(profiles) = ui.get("profiles") {
+        if fields.len() != 1 {
+            return Some(Err("profiles must be sent on its own".into()));
+        }
+        return Some(profiles::control(app, ctx, profiles));
+    }
     for (key, value) in fields {
         match key.as_str() {
             "set" | "scope" | "view" | "demosaic" => {}
@@ -1079,6 +1097,15 @@ fn history_keys(d: &mut CameraRawDialog, ctx: &egui::Context) {
 
 fn commit(app: &mut PhotocraftApp) -> Result<Value, String> {
     let d = app.camera_raw.as_ref().ok_or(tl!("Camera Raw isn't open"))?;
+    if d.profiles.busy() {
+        return Err("wait for the DCP profile preview to finish".into());
+    }
+    if let Some(raw) = &d.raw_open
+        && d.profiles.needs_apply(raw)
+    {
+        return Err("apply the selected DCP profile / white balance before opening the image".into());
+    }
+
     let result = match d.target {
         Target::NewFilter => {
             let mut p = d.command_params();
@@ -1208,6 +1235,7 @@ fn curve_editor(ui: &mut egui::Ui, p: &mut CameraRaw, dirty: &mut bool, state: &
 }
 
 pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    profiles::poll(app, ctx);
     if app.camera_raw.is_none()
         && let Some(raw) = app.pending_raw_open.take()
         && let Err(e) = open_raw(app, ctx, raw)
@@ -1350,6 +1378,9 @@ fn draw(app: &mut PhotocraftApp, ctx: &egui::Context, own_window: bool) {
         let mut dirty = false;
         egui::ScrollArea::vertical().id_salt("camera-raw-props").show(&mut props, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
+            if let Some(profile_action) = profiles::panel(ui, d) {
+                action = Some(profile_action);
+            }
             let p = &mut d.params;
             let alt = &mut d.scope.alt_tone;
             let (ts, tn) = (temp_stops(), tint_stops());
@@ -1505,6 +1536,22 @@ fn draw(app: &mut PhotocraftApp, ctx: &egui::Context, own_window: bool) {
         action = Some("cancel");
     }
     match action {
+        Some("dcp-import") => {
+            let r = profiles::import(app);
+            profiles::report(app, r);
+        }
+        Some("dcp-apply") => {
+            let r = profiles::apply(app, ctx);
+            profiles::report(app, r);
+        }
+        Some("dcp-create") => {
+            let r = profiles::create(app);
+            profiles::report(app, r);
+        }
+        Some("dcp-export") => {
+            let r = profiles::export(app);
+            profiles::report(app, r);
+        }
         Some("ok") => {
             if let Err(e) = commit(app) {
                 app.ui.status = e;
@@ -1852,6 +1899,69 @@ mod tests {
         (PhotocraftApp::new(photocraft_engine::Session::new(), services), spec.build())
     }
 
+    #[test]
+    fn dcp_library_creates_exports_and_restores_user_profiles() {
+        let (mut app, _) = raw_app();
+        // The profile builder needs a real calibration, not a guessed camera matrix.
+        let mut spec = photocraft_raw::testgen::DngSpec::cfa(16, 16, vec![10000; 256]);
+        spec.color_matrix1 = Some((23, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]));
+        let bytes = spec.build();
+        app.open_bytes("infrared.dng", &bytes).unwrap();
+        let ctx = egui::Context::default();
+        let raw = app.pending_raw_open.take().unwrap();
+        open_raw(&mut app, &ctx, raw).unwrap();
+        let tutorial = menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui":{"profiles":{"action":"tutorial","tutorialAction":"start"}}})).unwrap().unwrap();
+        assert_eq!(tutorial["tutorial"]["open"], true);
+        assert_eq!(tutorial["tutorial"]["step"], 1);
+        let tutorial = menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui":{"profiles":{"action":"tutorial","tutorialAction":"next"}}})).unwrap().unwrap();
+        assert_eq!(tutorial["tutorial"]["step"], 2);
+        let before = app.camera_raw.as_ref().unwrap().profiles.describe(None);
+        assert!(menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui":{"profiles":{"action":"tutorial","tutorialAction":"invalid"}}})).unwrap().is_err());
+        assert_eq!(app.camera_raw.as_ref().unwrap().profiles.describe(None), before);
+        let created =
+            menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui":{"profiles":{"action":"create","name":"IR test","calibrationMultipliers":[0.5,1.0,1.0]}}}))
+                .unwrap()
+                .unwrap();
+        assert_eq!(created["created"], 0);
+        let library = app.camera_raw.as_ref().unwrap().profiles.describe(None);
+        assert_eq!(library["library"][0]["name"], "IR test");
+        assert!(commit(&mut app).is_err(), "an unapplied selection must not silently open with the default profile");
+        let before = library.clone();
+        assert!(menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui":{"profiles":{"action":"select","index":99}}})).unwrap().is_err());
+        assert_eq!(app.camera_raw.as_ref().unwrap().profiles.describe(None), before);
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = written.clone();
+        app.services.write = Some(Box::new(move |_: &str, bytes: &[u8]| {
+            *sink.lock().unwrap() = bytes.to_vec();
+            Ok(())
+        }));
+        app.services.file_dialog = Some(crate::file_dialog::fake(vec![Some(crate::file_dialog::FileDialogAnswer::SaveTo("/out/IR.dcp".into()))]).0);
+        profiles::export(&mut app).unwrap();
+        app.poll_file_dialog(&ctx, None);
+        app.poll_file_dialog(&ctx, None);
+        let exported = photocraft_io::raw::CameraProfile::parse(&written.lock().unwrap()).unwrap();
+        assert_eq!(exported.name, "IR test");
+        let saved = app.session.prefs_to_json();
+        let mut restored = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        restored.session.load_prefs_json(&saved).unwrap();
+        let panel = profiles::Panel::load(&restored);
+        assert_eq!(panel.describe(None)["library"][0]["name"], "IR test");
+        profiles::apply(&mut app, &ctx).unwrap();
+        // A choice made while the profile worker runs belongs to the next Open.
+        app.camera_raw.as_mut().unwrap().raw_open.as_mut().unwrap().demosaic = photocraft_io::raw::Demosaic::Bilinear;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.camera_raw.as_ref().unwrap().profiles.busy() {
+            profiles::poll(&mut app, &ctx);
+            assert!(std::time::Instant::now() < deadline, "profile worker timed out");
+            std::thread::yield_now();
+        }
+        let d = app.camera_raw.as_ref().unwrap();
+        assert_eq!(d.profiles.describe(d.raw_open.as_ref())["applied"], "IR test");
+        assert_eq!(d.raw_open.as_ref().unwrap().demosaic, photocraft_io::raw::Demosaic::Bilinear);
+        let opened = commit(&mut app).unwrap();
+        assert_eq!(opened["redeveloped"], true);
+    }
+
     fn mean_red(app: &PhotocraftApp) -> f32 {
         let st = app.session.active().unwrap();
         let s = st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap();
@@ -2066,7 +2176,9 @@ mod tests {
                     path: None,
                     bytes: None,
                     developed_with: Default::default(),
-                    demosaic: Default::default()
+                    demosaic: Default::default(),
+                    camera_profile: None,
+                    white_balance_multipliers: None,
                 }
             )
             .is_err()

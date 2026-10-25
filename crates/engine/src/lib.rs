@@ -102,6 +102,7 @@ pub mod presets;
 pub mod print_cmds;
 pub mod proof_sim;
 pub mod rasterize_style_cmds;
+pub mod raw_profile_cmds;
 pub mod redeye_cmds;
 pub mod render_cmds;
 pub mod retouch_cmds;

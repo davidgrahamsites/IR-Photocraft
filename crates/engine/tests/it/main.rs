@@ -60,6 +60,7 @@ mod precheck;
 mod prefs_usage;
 mod rasterize_psd_reopen;
 mod rasterize_selected_layers;
+mod raw_profiles;
 mod rendering_preferences;
 mod save_keeps_encoding;
 mod selection_layer_commands;

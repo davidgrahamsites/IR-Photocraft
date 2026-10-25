@@ -436,3 +436,84 @@ fn a_re_develop_keeps_the_fitted_look() {
     let mid = curve.iter().find(|k| k[0] >= 0.18).unwrap();
     assert!(mid[1] > mid[0], "{mid:?}");
 }
+
+#[test]
+fn custom_ir_profile_roundtrips_and_explicit_white_balance_reaches_the_raw_stage() {
+    use photocraft_io::raw::{CameraProfile, RawTuning, create_camera_profile, import_raw_tuned};
+    let (w, h) = (24, 16);
+    let mut spec = DngSpec::cfa(w, h, mosaic(&scene(w, h), w, [0, 1, 1, 2], 0, 65535));
+    spec.color_matrix1 = Some((21, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]));
+    let raw = spec.build();
+    let bytes = create_camera_profile(&raw, None, "Infrared 720nm", [0.25, 1.0, 3.0]).unwrap();
+    let profile = CameraProfile::parse(&bytes).unwrap();
+    assert_eq!(profile.name, "Infrared 720nm");
+    let tuning = RawTuning { camera_profile: Some(std::sync::Arc::new(profile)), white_balance_multipliers: Some([0.1, 1.0, 4.0]), ..Default::default() };
+    let (developed, applied) = import_raw_tuned("IR.dng", &raw, &tuning).unwrap();
+    assert!(applied, "explicit IR balance applies even without an as-shot WB tag");
+    assert_eq!(developed.document.depth, SampleType::U16);
+    assert!(developed.warnings.iter().any(|w| w.contains("Infrared 720nm")), "{:?}", developed.warnings);
+    let (normal, _) = import_raw_tuned("IR.dng", &raw, &Default::default()).unwrap();
+    let actual = photocraft_io::document_to_image(&developed.document, &mut Vec::new()).unwrap();
+    let before = photocraft_io::document_to_image(&normal.document, &mut Vec::new()).unwrap();
+    assert_ne!(actual.data(), before.data());
+}
+
+#[test]
+fn custom_ir_balance_rejects_invalid_gains_without_a_document() {
+    let raw = DngSpec::cfa(16, 16, vec![1000; 256]).build();
+    for gains in [[0.0, 1.0, 1.0], [-1.0, 1.0, 1.0], [f64::NAN, 1.0, 1.0], [f64::INFINITY, 1.0, 1.0]] {
+        let tuning = photocraft_io::raw::RawTuning { white_balance_multipliers: Some(gains), ..Default::default() };
+        assert!(photocraft_io::raw::import_raw_tuned("IR.dng", &raw, &tuning).is_err());
+    }
+}
+
+#[test]
+fn ir_explicit_balance_composes_with_temperature_and_tint_without_refitting() {
+    use photocraft_io::raw::{RawTuning, import_raw_tuned};
+    let (w, h) = (24, 16);
+    let bytes = DngSpec::cfa(w, h, mosaic(&scene(w, h), w, [0, 1, 1, 2], 0, 65535)).build();
+    let tuning = RawTuning { temperature: -70.0, tint: 25.0, white_balance_multipliers: Some([0.2, 1.0, 4.0]), ..Default::default() };
+    let (actual, applied) = import_raw_tuned("IR.dng", &bytes, &tuning).unwrap();
+    assert!(applied);
+    let gains = photocraft_algo::camera_raw::white_balance_gains(tuning.temperature, tuning.tint).map(f64::from);
+    let expected = photocraft_raw::develop(
+        &bytes,
+        &photocraft_raw::DevelopOptions {
+            white_balance: photocraft_raw::WhiteBalance::Multipliers([0.2 * gains[0], gains[1], 4.0 * gains[2]]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected: Vec<_> = expected.rgb.iter().flat_map(|value| value.to_ne_bytes()).collect();
+    assert_eq!(photocraft_io::document_to_image(&actual.document, &mut Vec::new()).unwrap().data(), expected);
+}
+
+#[test]
+fn ir_profile_can_be_created_from_an_imported_base_without_raw_bytes() {
+    use photocraft_io::raw::{CameraProfile, create_camera_profile, tone_curve_with_profile};
+    let mut spec = DngSpec::cfa(16, 16, vec![5000; 256]);
+    spec.color_matrix1 = Some((21, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]));
+    let raw = spec.build();
+    let base = create_camera_profile(&raw, None, "Base", [1.0; 3]).unwrap();
+    let modified = create_camera_profile(&[], Some(&base), "IR 590nm", [0.5, 1.0, 2.0]).unwrap();
+    let profile = CameraProfile::parse(&modified).unwrap();
+    assert_eq!(profile.name, "IR 590nm");
+    assert!(tone_curve_with_profile(&raw, Some(&profile)).unwrap().is_empty());
+    spec.model = "Different camera".into();
+    assert!(tone_curve_with_profile(&spec.build(), Some(&profile)).is_err());
+    for name in ["", "bad\0name"] {
+        assert!(create_camera_profile(&[], Some(&base), name, [1.0; 3]).is_err());
+    }
+}
+
+#[test]
+fn a_selected_dcp_never_silently_falls_back_to_a_camera_jpeg() {
+    use photocraft_io::raw::{CameraProfile, create_camera_profile, import_raw_with};
+    let mut spec = DngSpec::cfa(16, 16, vec![5000; 256]);
+    spec.color_matrix1 = Some((21, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]));
+    let base = create_camera_profile(&spec.build(), None, "IR", [1.0; 3]).unwrap();
+    let opts = photocraft_raw::DevelopOptions { camera_profile: Some(std::sync::Arc::new(CameraProfile::parse(&base).unwrap())), ..Default::default() };
+    let raw = nef_with_preview();
+    assert!(import("preview.nef", &raw).is_ok(), "ordinary imports retain preview fallback");
+    assert!(import_raw_with("preview.nef", &raw, &opts).is_err(), "a camera JPEG cannot use a DCP calibration");
+}

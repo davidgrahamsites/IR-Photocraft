@@ -13,6 +13,9 @@
 
 <h1 align="center">PhotoCraft</h1>
 
+This IR-Photocraft fork adds a saved DCP camera-profile library, custom sensor white balance,
+and infrared profile creation/export. See the [infrared camera-profile guide](docs/infrared-camera-profiles.md).
+
 <p align="center">
   <b>Image editing; an open-source, clean-room reimplementation of Adobe Photoshop, rebuilt in pure Rust.</b><br>
   Layers, masks, adjustment layers, layer styles, type, vectors, brushes and real PSD files,<br>

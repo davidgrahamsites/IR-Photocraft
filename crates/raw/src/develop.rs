@@ -40,6 +40,8 @@ pub struct DevelopOptions {
     /// A colour rendering fitted to the camera's own JPEG ([`crate::fit_look`]). When set it
     /// replaces the file's colour calibration (or the neutral fallback) and adds its tone curve.
     pub camera_look: Option<CameraLook>,
+    /// An imported DCP, applied before white balance and user tone adjustments.
+    pub camera_profile: Option<std::sync::Arc<crate::CameraProfile>>,
 }
 
 impl Default for DevelopOptions {
@@ -52,6 +54,7 @@ impl Default for DevelopOptions {
             tone: Tone::default(),
             limits: Limits::default(),
             camera_look: None,
+            camera_profile: None,
         }
     }
 }
@@ -160,7 +163,11 @@ fn grey_world(s: &Sensor, sc: &Scale) -> [f64; 3] {
 
 fn normalize(n: [f64; 3]) -> Option<[f64; 3]> {
     let m = n.iter().cloned().fold(f64::MIN, f64::max);
-    (m > 0.0 && n.iter().all(|v| v.is_finite() && *v > 1e-4)).then(|| n.map(|v| v / m))
+    if !m.is_finite() || m <= 0.0 || n.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return None;
+    }
+    let normalized = n.map(|v| v / m);
+    normalized.iter().all(|v| *v >= 1e-12).then_some(normalized)
 }
 
 /// The camera-space neutral (max component 1) for `opts.white_balance`, as
@@ -170,11 +177,13 @@ pub(crate) fn resolve_neutral(s: &Sensor, opts: &DevelopOptions, sc: &Scale, war
     if s.is_monochrome() {
         return Ok([1.0; 3]);
     }
+    // A selected DCP changes the reference-camera mapping before white balance.
+    let custom_color = opts.camera_profile.as_ref().map(|p| p.color_info(&s.color));
+    let color = custom_color.as_ref().unwrap_or(&s.color);
     // White balance: camera-space neutral, max component 1.
-    let as_shot = s
-        .color
+    let as_shot = color
         .as_shot_neutral
-        .or_else(|| s.color.as_shot_white_xy.and_then(|xy| s.color.xy_to_neutral(xy)))
+        .or_else(|| color.as_shot_white_xy.and_then(|xy| color.xy_to_neutral(xy)))
         .or_else(|| s.camera_wb.map(|m| m.map(|v| 1.0 / v)))
         .and_then(normalize);
     Ok(match opts.white_balance {
@@ -223,18 +232,26 @@ pub fn develop_sensor(s: &Sensor, opts: &DevelopOptions) -> Result<Developed> {
     let mut warnings = s.warnings.clone();
     let sc = Scale::new(s);
 
+    let profile = opts.camera_profile.as_deref();
+    if let Some(p) = profile {
+        p.validate_sensor(s)?;
+        warnings.push(format!("custom camera profile: {}", p.name));
+    }
+    let custom_color = profile.map(|p| p.color_info(&s.color));
+    let color_info = custom_color.as_ref().unwrap_or(&s.color);
     let neutral = resolve_neutral(s, opts, &sc, &mut warnings)?;
+    let profile_weight = profile.map_or(1.0, |p| p.map_weight(color_info, neutral));
     let mult = neutral.map(|v| (1.0 / v) as f32);
 
     // Balanced camera → XYZ D50: a look fitted to the camera's JPEG, the file's calibration,
     // or the neutral fallback.
     // Monochrome data stays neutral grey: no camera look and no colour calibration.
     let mono = s.is_monochrome();
-    let look = opts.camera_look.as_ref().filter(|l| l.is_usable() && !mono);
-    if opts.camera_look.is_some() && look.is_none() && !mono {
+    let look = opts.camera_look.as_ref().filter(|l| l.is_usable() && !mono && profile.is_none());
+    if opts.camera_look.is_some() && look.is_none() && !mono && profile.is_none() {
         warnings.push("the supplied camera look is not usable (non-finite or singular); ignored".into());
     }
-    let to_xyz: Mat3 = match (look, s.color.balanced_to_xyz_d50(neutral)) {
+    let to_xyz: Mat3 = match (look, color_info.balanced_to_xyz_d50(neutral)) {
         (Some(l), _) => {
             warnings.push(l.note());
             l.to_xyz
@@ -247,8 +264,11 @@ pub fn develop_sensor(s: &Sensor, opts: &DevelopOptions) -> Result<Developed> {
             color::srgb_to_xyz_d50()
         }
     };
-    let gain = 2f64.powf(s.baseline_exposure + opts.exposure.clamp(-10.0, 10.0));
-    let out_m = color::scale(&color::mul(&color::xyz_d50_to_prophoto(), &to_xyz), gain);
+    let gain = 2f64.powf(s.baseline_exposure + profile.map_or(0.0, |p| p.exposure_offset()) + opts.exposure.clamp(-10.0, 10.0));
+    // The DCP hue/saturation map precedes exposure; its look table follows user exposure and
+    // fill-light/tone stages, before the profile tone curve (DNG ProfileLookTableData).
+    let matrix_gain = if profile.is_some() { 1.0 } else { gain };
+    let out_m = color::scale(&color::mul(&color::xyz_d50_to_prophoto(), &to_xyz), matrix_gain);
     let out_m: [[f32; 3]; 3] = out_m.map(|r| r.map(|v| v as f32));
 
     // Neutral grey through `out_m`: the gain alone (the matrix maps camera white to ProPhoto
@@ -357,23 +377,28 @@ pub fn develop_sensor(s: &Sensor, opts: &DevelopOptions) -> Result<Developed> {
     let y_row = color::rgb_to_xyz(color::ROMM, color::D50_XY)[1].map(|v| v as f32);
     let lum = |v: &[f32; 3]| y_row[0] * v[0] + y_row[1] * v[1] + y_row[2] * v[2];
     // Monochrome: the one sample, grey; no colour matrix.
-    let pro = |p: &[f32]| if mono { [grey_gain * p[0]; 3] } else { [0, 1, 2].map(|k| out_m[k][0] * p[0] + out_m[k][1] * p[1] + out_m[k][2] * p[2]) };
+    let pro = |p: &[f32]| {
+        let v = if mono { [grey_gain * p[0]; 3] } else { [0, 1, 2].map(|k| out_m[k][0] * p[0] + out_m[k][1] * p[1] + out_m[k][2] * p[2]) };
+        profile.map_or(v, |profile| profile.map_color(v, profile_weight).map(|c| c * gain as f32))
+    };
+    let black_point = profile.map_or(s.black_point, |p| p.black_point(s.black_point));
     let haze = Haze::new(w, h, |i| pro(&rgb[i * 3..i * 3 + 3]), opts.tone.dehaze);
     // Linear ProPhoto of pixel `i` after Dehaze.
     let linear = |i: usize, p: &[f32]| {
         let v = pro(p);
         haze.as_ref().map_or(v, |z| z.apply(i % w, i / w, v))
     };
-    let mut map = ToneMap::new(w, h, |i| lum(&linear(i, &rgb[i * 3..i * 3 + 3])), opts.tone, s.black_point);
+    let mut map = ToneMap::new(w, h, |i| lum(&linear(i, &rgb[i * 3..i * 3 + 3])), opts.tone, black_point);
     if let (Some(m), Some(_)) = (&mut map, &haze) {
         // The black point belongs to the default rendering: Dehaze does not move it (taken after
         // Dehaze it fell to almost 0, and Dehaze darkened less than Photoshop's).
-        m.black = black_level(w, h, |i| lum(&pro(&rgb[i * 3..i * 3 + 3])), s.black_point);
+        m.black = black_level(w, h, |i| lum(&pro(&rgb[i * 3..i * 3 + 3])), black_point);
     }
     let mut out = vec![0u16; w * h * 3];
-    let lut = match look {
-        Some(l) => GammaLut::with_tone(l.tone.as_ref()),
-        None => GammaLut::with_curve(&s.tone_curve),
+    let lut = match (profile, look) {
+        (Some(p), _) => GammaLut::with_profile(p),
+        (None, Some(l)) => GammaLut::with_tone(l.tone.as_ref()),
+        (None, None) => GammaLut::with_curve(&s.tone_curve),
     };
     par::chunks_mut(&mut out, band * w * 3, |b, chunk| {
         let start = b * band * w * 3;
@@ -385,6 +410,9 @@ pub fn develop_sensor(s: &Sensor, opts: &DevelopOptions) -> Result<Developed> {
                 // The black point first, as Camera Raw: lifting before it would flatten the
                 // deepest shadows' contrast.
                 v = v.map(|c| m.unblack(c) * g);
+            }
+            if let Some(profile) = profile {
+                v = profile.apply_look(v);
             }
             for k in 0..3 {
                 o[k] = lut.encode(v[k]);
@@ -495,6 +523,17 @@ impl GammaLut {
             })
             .collect();
         GammaLut { table }
+    }
+
+    fn with_profile(profile: &crate::CameraProfile) -> Self {
+        let spline = crate::profile::ProfileSpline::new(profile.tone_curve());
+        let table = (0..=GAMMA_STEPS + 1)
+            .map(|i| {
+                let s = (i as f32 / GAMMA_STEPS as f32).min(1.0);
+                spline.eval(s * s).powf(1.0 / 1.8) * 65535.0
+            })
+            .collect();
+        Self { table }
     }
 
     /// The gamma-1.8 encoding after a fitted [`ToneCurve`] (`None`: none, plain gamma 1.8).

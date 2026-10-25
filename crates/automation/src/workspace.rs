@@ -409,7 +409,9 @@ fn command_uses_ambient_path(id: &str, params: &Value) -> bool {
         "edit.keyboardShortcuts" => {
             params.get("path").is_some() || ["importKys", "exportKys", "summarize"].iter().any(|k| params.get(*k).and_then(|v| v.get("path")).is_some())
         }
-        "plugin.reload" => true,
+        // These RAW commands read source/profile paths and may write a DCP. They have no
+        // capability-scoped byte transport, so even a request with `data` must not bypass this.
+        "raw.profile.inspect" | "raw.profile.create" | "raw.open" | "plugin.reload" => true,
         _ => false,
     }
 }
@@ -830,6 +832,20 @@ mod tests {
         assert!(visible(&headless), "a refused data set applies none of its values");
         assert!(headless.command_run("image.applyDataSet", serde_json::json!({"name": "hidden"})).is_ok());
         assert!(!visible(&headless));
+    }
+
+    #[test]
+    fn automation_rejects_raw_profile_ambient_filesystem_commands() {
+        for id in ["raw.profile.inspect", "raw.profile.create", "raw.open"] {
+            for params in [
+                serde_json::json!({}),
+                serde_json::json!({"path": "/outside/photo.dng", "profilePath": "/outside/profile.dcp"}),
+                serde_json::json!({"data": "QUJD", "sourcePath": "/outside/photo.dng"}),
+            ] {
+                assert!(authorize_engine_command(id, &params).is_err(), "{id}: {params}");
+                assert!(authorize_desktop_engine_command(id, &params).is_err(), "{id}: {params}");
+            }
+        }
     }
 
     #[test]

@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use photocraft_cms::{Builtin, Intent, Profile, Transform};
 use photocraft_codecs::{self as codecs, ChannelLayout, Format, Image, SampleType};
-pub use photocraft_raw::Demosaic;
 use photocraft_raw::{CameraLook, DevelopOptions, Limits, PreviewColorSpace, RawError, Reference, Sensor, WhiteBalance};
+pub use photocraft_raw::{CameraProfile, Demosaic, MAX_DCP_BYTES};
 pub use photocraft_raw::{EXTENSIONS, Tone, retone};
 
 use crate::flat::image_to_document;
@@ -51,7 +51,7 @@ fn upright_preview(raw: &[u8], jpeg: &[u8], limits: &photocraft_raw::Limits) -> 
 /// Camera Raw's Temperature, Tint, Exposure, Shadows, Highlights, Clarity, Texture and Dehaze,
 /// applied while developing the sensor data (the open-time Camera Raw dialog) instead of to the
 /// developed RGB pixels, and the demosaic method.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RawTuning {
     /// −100…100, as `photocraft_algo::camera_raw::CameraRaw::temperature`.
     pub temperature: f32,
@@ -71,19 +71,28 @@ pub struct RawTuning {
     pub texture: f32,
     /// −100…100, as `CameraRaw::dehaze`.
     pub dehaze: f32,
+    /// User-supplied DCP calibration; replaces the default camera/JPEG rendering.
+    pub camera_profile: Option<Arc<CameraProfile>>,
+    /// Camera-channel gains for IR white balance, independent of visible-light temperature
+    /// limits. Temperature and Tint are applied on top of these gains.
+    pub white_balance_multipliers: Option<[f64; 3]>,
 }
 
 /// Develops a raw file with `tuning` applied at the raw stage: Exposure as develop exposure,
 /// Shadows, Highlights, Clarity, Texture and Dehaze in linear light before the tone curve, Temperature / Tint as gains on the
 /// camera's as-shot white-balance multipliers (the same gains the Camera Raw filter applies to
-/// RGB). The second value is `false` when the file has
-/// no as-shot white balance: Temperature / Tint were then not applied, and the caller keeps
-/// them as RGB adjustments.
+/// RGB). Explicit camera-channel multipliers replace the as-shot white balance and support
+/// infrared values outside visible-light temperature limits. The second value is `false` when
+/// neither explicit multipliers nor as-shot white balance are available: Temperature / Tint
+/// were then not applied, and the caller keeps them as RGB adjustments.
 pub fn import_raw_tuned(name: &str, bytes: &[u8], tuning: &RawTuning) -> Result<(ImportResult, bool), IoError> {
     let format = photocraft_raw::identify(bytes).map(|f| f.name()).unwrap_or("camera raw");
     let exposure = f64::from(tuning.exposure);
     if !exposure.is_finite() || !(-10.0..=10.0).contains(&exposure) {
         return Err(IoError::Raw(RawError::Malformed(format!("exposure {} EV is out of range", tuning.exposure))));
+    }
+    if let Some(gains) = tuning.white_balance_multipliers {
+        validate_ir_gains(gains)?;
     }
     let sensor = photocraft_raw::decode(bytes, &limits()).map_err(IoError::Raw)?;
     let slider = |v: f32| if v.is_finite() { v.clamp(-100.0, 100.0) } else { 0.0 };
@@ -96,9 +105,17 @@ pub fn import_raw_tuned(name: &str, bytes: &[u8], tuning: &RawTuning) -> Result<
     };
     // The colour rendering the default open used (a look fitted to the camera's JPEG for files
     // without colour calibration), so re-developing changes only what the sliders change.
-    let camera_look = default_look(bytes, &sensor);
-    let mut opts = DevelopOptions { limits: limits(), exposure, demosaic: tuning.demosaic, tone, camera_look, ..Default::default() };
-    let wb_applied = match sensor.camera_wb {
+    let camera_look = if tuning.camera_profile.is_none() { default_look(bytes, &sensor) } else { None };
+    let mut opts = DevelopOptions {
+        limits: limits(),
+        exposure,
+        demosaic: tuning.demosaic,
+        tone,
+        camera_look,
+        camera_profile: tuning.camera_profile.clone(),
+        ..Default::default()
+    };
+    let wb_applied = match tuning.white_balance_multipliers.or(sensor.camera_wb) {
         Some(m) => {
             let g = wb_gains(tuning.temperature, tuning.tint);
             opts.white_balance = WhiteBalance::Multipliers([m[0] * g[0], m[1] * g[1], m[2] * g[2]]);
@@ -107,7 +124,9 @@ pub fn import_raw_tuned(name: &str, bytes: &[u8], tuning: &RawTuning) -> Result<
         None => false,
     };
     let dev = photocraft_raw::develop_sensor(&sensor, &opts).map_err(IoError::Raw)?;
-    let wb = if wb_applied {
+    let wb = if tuning.white_balance_multipliers.is_some() {
+        format!("explicit camera-channel white balance, temperature {:+.0}, tint {:+.0}", tuning.temperature, tuning.tint)
+    } else if wb_applied {
         format!("as-shot white balance, temperature {:+.0}, tint {:+.0}", tuning.temperature, tuning.tint)
     } else {
         "estimated white balance".into()
@@ -131,6 +150,43 @@ pub fn tone_curve(bytes: &[u8]) -> Vec<[f32; 2]> {
         Some(look) => look.tone.as_ref().map(look_knots).unwrap_or_default(),
         None => sensor.tone_curve,
     }
+}
+
+/// The selected DCP's tone curve sampled for the Camera Raw linear-light preview.
+/// Validation is shared with development: a profile for another camera is an error.
+pub fn tone_curve_with_profile(bytes: &[u8], profile: Option<&CameraProfile>) -> Result<Vec<[f32; 2]>, IoError> {
+    let Some(profile) = profile else { return Ok(tone_curve(bytes)) };
+    let sensor = photocraft_raw::decode(bytes, &limits())?;
+    if sensor.is_monochrome() {
+        return Err(IoError::Unsupported("DCP camera profiles require a colour sensor".into()));
+    }
+    if !profile.matches_camera(sensor.make.as_deref(), sensor.model.as_deref()) {
+        return Err(IoError::Raw(RawError::Malformed("DCP profile does not match this camera".into())));
+    }
+    Ok(profile.sampled_tone_curve())
+}
+
+/// Create an exportable custom IR calibration from a camera raw's calibration, or from a
+/// user-owned DCP. Multipliers shift the profile's white-balance interpretation; this does not
+/// measure the camera's spectral response. A base profile needs no raw bytes.
+pub fn create_camera_profile(raw_bytes: &[u8], base_profile: Option<&[u8]>, name: &str, multipliers: [f64; 3]) -> Result<Vec<u8>, IoError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 1024 || name.contains('\0') {
+        return Err(IoError::Raw(RawError::Malformed("camera profile name must contain 1–1024 UTF-8 bytes and no NUL".into())));
+    }
+    let mut profile = match base_profile {
+        Some(bytes) => CameraProfile::parse(bytes)?,
+        None => CameraProfile::from_sensor(&photocraft_raw::decode(raw_bytes, &limits())?, name)?,
+    };
+    profile.name = name.to_string();
+    Ok(profile.with_white_balance_multipliers(multipliers)?.to_dcp()?)
+}
+
+fn validate_ir_gains(gains: [f64; 3]) -> Result<(), IoError> {
+    if gains.iter().any(|gain| !gain.is_finite() || !(1e-6..=1e6).contains(gain)) {
+        return Err(IoError::Raw(RawError::Malformed("IR white-balance multipliers must be finite, positive and within 0.000001–1000000".into())));
+    }
+    Ok(())
 }
 
 /// A fitted look's tone curve as knots for [`photocraft_raw::retone`] (which reads them
@@ -248,6 +304,7 @@ fn develop_fitted(bytes: &[u8], opts: &DevelopOptions) -> Result<photocraft_raw:
     let sensor = photocraft_raw::decode(bytes, &opts.limits)?;
     let mut opts = Cow::Borrowed(opts);
     if opts.camera_look.is_none()
+        && opts.camera_profile.is_none()
         && sensor.color.calibrations.is_empty()
         && !sensor.is_monochrome()
         && let Ok(look) = fit_preview_look(bytes, &sensor, &opts)
@@ -271,8 +328,9 @@ pub fn developed_demosaic(warnings: &[String]) -> Option<Demosaic> {
     Demosaic::from_id(id)
 }
 
-/// Develops a raw file with explicit settings. Without `opts.camera_look`, a file without
-/// colour calibration gets one fitted to its embedded JPEG when that clearly helps.
+/// Develops a raw file with explicit settings. Without `opts.camera_look` or a selected DCP,
+/// a file without colour calibration gets a look fitted to its embedded JPEG when that clearly
+/// helps. A selected DCP requires decoded sensor data and never falls back to a camera JPEG.
 pub fn import_raw_with(name: &str, bytes: &[u8], opts: &DevelopOptions) -> Result<ImportResult, IoError> {
     let format = photocraft_raw::identify(bytes).map(|f| f.name()).unwrap_or("camera raw");
     match develop_fitted(bytes, opts) {
@@ -280,6 +338,7 @@ pub fn import_raw_with(name: &str, bytes: &[u8], opts: &DevelopOptions) -> Resul
             let summary = format!("{DEVELOPED_NOTE} ({} demosaic, as-shot white balance)", opts.demosaic.id());
             developed_document(name, bytes, format, dev, &summary)
         }
+        Err(RawError::Unsupported(reason)) if opts.camera_profile.is_some() => Err(IoError::Raw(RawError::Unsupported(reason))),
         Err(RawError::Unsupported(reason)) => match photocraft_raw::embedded_preview(bytes) {
             Some(p) => {
                 let img = upright_preview(bytes, p.jpeg, &opts.limits)?;

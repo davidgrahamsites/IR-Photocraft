@@ -1,6 +1,7 @@
 //! The crate's integration tests, linked into one test binary.
 
 mod cr3;
+mod dcp;
 mod development_limits;
 mod dng;
 mod hostile;

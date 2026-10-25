@@ -59,6 +59,7 @@ mod opcodes;
 mod orf;
 mod par;
 mod preview;
+mod profile;
 mod raf;
 mod rw2;
 mod saturation;
@@ -78,6 +79,7 @@ pub use crate::error::RawError;
 pub use crate::look::{CameraLook, LookRejected, PROXY_EDGE, Reference, ToneCurve, fit_look};
 pub use crate::opcodes::GainMap;
 pub use crate::preview::{Preview, PreviewColorSpace, embedded_preview, embedded_preview_color_space, embedded_previews};
+pub use crate::profile::{CameraProfile, MAX_DCP_BYTES};
 pub use crate::sensor::{BlackLevels, Cfa, Rect, Sensor};
 pub use crate::tone::{Tone, retone};
 

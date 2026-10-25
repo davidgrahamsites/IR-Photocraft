@@ -168,3 +168,31 @@ embedded JPEG previews.
 camera-JPEG colour fit, reports ΔE against the embedded JPEG with the neutral fallback and with the
 fit, and can write 1200-pixel sRGB PNGs of both and of the JPEG; `--synthetic` times it on a
 generated 24 MP file.
+
+## Custom infrared camera profiles (`.dcp`)
+
+`CameraProfile::parse` imports user-supplied DNG camera profiles without installing Adobe assets.
+Pass an `Arc<CameraProfile>` in `DevelopOptions::camera_profile` to select it during sensor
+conversion, before user edits. The selected profile replaces the default camera rendering and
+JPEG-fitted look. Model-specific profiles reject a different or unidentified camera.
+
+The bounded reader supports either byte order, single/dual-illuminant ColorMatrix and
+ForwardMatrix sets, ProfileToneCurve (natural cubic spline), hue/saturation maps and look tables
+(trilinear interpolation, linear or sRGB value-axis encoding), BaselineExposureOffset and
+DefaultBlackRender. At most 32 MiB is accepted. HDR profiles, gain/RGB tables, custom/third
+illuminants and multi-channel reduction matrices return an explicit unsupported error; they are
+never silently rendered as a partial profile. Profile copyright and embedding-policy metadata
+survive export. Per-camera calibration is not reused without a verified calibration signature.
+
+`CameraProfile::from_sensor` starts a profile from a raw's existing calibration; it requires a
+camera model and colour calibration. If a native raw has no calibration, import a base DCP or
+convert it to a calibrated DNG first. `with_white_balance_multipliers([r, g, b])` adjusts the
+reference-camera response for infrared work: gains are normalized to green and multiply the
+ColorMatrix rows; non-identity gains clear ForwardMatrix so the adjusted matrix takes effect,
+while tone/look tables remain. This is a user-authored response adjustment, not a measured
+spectral calibration. `to_dcp` writes the resulting standalone profile. Explicit raw-stage
+`WhiteBalance::Multipliers` accepts wide positive gains with a bounded channel ratio, so infrared
+white balance does not depend on a visible-light Kelvin slider range.
+
+Format reference: [Adobe DNG Specification 1.7.1](https://helpx.adobe.com/content/dam/help/en/camera-raw/digital-negative/jcr_content/root/content/flex/items/position/position-par/download_section_733958301/download-1/DNG_Spec_1_7_1_0.pdf),
+Camera Profiles and chapter 6. This product includes DNG technology under license by Adobe.
